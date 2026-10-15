@@ -1,0 +1,223 @@
+from __future__ import annotations
+
+import json
+import sqlite3
+from datetime import datetime
+from uuid import uuid4
+from zoneinfo import ZoneInfo
+
+from fastapi import APIRouter, Depends, File, Form, HTTPException, UploadFile, status
+from pydantic import BaseModel, Field, ValidationError
+
+from ..config import settings
+from ..database import get_db
+from ..security import require_camera, require_user
+from ..services.serializers import camera_to_dict, event_to_dict
+from ..services.storage import save_evidence
+from ..services.time_utils import parse_iso, to_iso, utc_now
+from ..websocket import manager
+
+router = APIRouter(prefix='/api/v1', tags=['cameras'])
+
+
+class HeartbeatPayload(BaseModel):
+    camera_id: str = Field(min_length=1, max_length=120)
+    camera_name: str | None = Field(default=None, max_length=160)
+    location: str | None = Field(default=None, max_length=200)
+    model_version: str | None = Field(default=None, max_length=120)
+
+
+class CameraEventPayload(BaseModel):
+    camera_id: str = Field(min_length=1, max_length=120)
+    camera_name: str | None = Field(default=None, max_length=160)
+    location: str | None = Field(default=None, max_length=200)
+    person_track_id: str | None = Field(default=None, max_length=120)
+    captured_at: datetime
+    current_status: str
+    previous_status: str | None = None
+    missing_ppe: list[str] = Field(default_factory=list)
+    detected_ppe: list[str] = Field(default_factory=list)
+    confidence: float = Field(ge=0, le=1)
+    person_count: int = Field(ge=1, le=99)
+    model_version: str | None = Field(default=None, max_length=120)
+
+
+def _normalize_status(value: str) -> str:
+    normalized = value.strip().upper().replace('-', '_').replace(' ', '_')
+    if normalized not in {'SAFE', 'NOT_SAFE'}:
+        raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail='current_status ต้องเป็น SAFE หรือ NOT_SAFE')
+    return normalized
+
+
+def _normalize_ppe(value: str) -> str:
+    normalized = value.strip().lower().replace('_', '-')
+    aliases = {'safetyvest': 'safety-vest', 'vest': 'safety-vest'}
+    return aliases.get(normalized, normalized)
+
+
+def _captured_at(payload: CameraEventPayload) -> datetime:
+    value = payload.captured_at
+    if value.tzinfo is None:
+        value = value.replace(tzinfo=ZoneInfo(settings.timezone))
+    return value.astimezone(ZoneInfo('UTC'))
+
+
+def _upsert_camera(
+    db: sqlite3.Connection,
+    camera_id: str,
+    camera_name: str | None,
+    location: str | None,
+    model_version: str | None,
+    now_iso: str,
+) -> sqlite3.Row:
+    row = db.execute('SELECT * FROM cameras WHERE id = ?', (camera_id,)).fetchone()
+    if row is None:
+        db.execute(
+            '''INSERT INTO cameras (id, name, location, status, last_heartbeat_at, model_version, updated_at)
+               VALUES (?, ?, ?, 'ONLINE', ?, ?, ?)''',
+            (camera_id, camera_name or camera_id, location or '-', now_iso, model_version, now_iso),
+        )
+    else:
+        db.execute(
+            '''UPDATE cameras SET name = ?, location = ?, status = 'ONLINE', last_heartbeat_at = ?,
+               model_version = COALESCE(?, model_version), updated_at = ? WHERE id = ?''',
+            (camera_name or row['name'], location or row['location'], now_iso, model_version, now_iso, camera_id),
+        )
+    return db.execute('SELECT * FROM cameras WHERE id = ?', (camera_id,)).fetchone()
+
+
+@router.post('/cameras/heartbeat')
+async def heartbeat(payload: HeartbeatPayload, _: None = Depends(require_camera), db: sqlite3.Connection = Depends(get_db)) -> dict:
+    now = to_iso(utc_now())
+    _upsert_camera(db, payload.camera_id, payload.camera_name, payload.location, payload.model_version, now)
+    db.commit()
+    row = db.execute('SELECT * FROM cameras WHERE id = ?', (payload.camera_id,)).fetchone()
+    camera = camera_to_dict(row)
+    await manager.broadcast({'type': 'camera_heartbeat', 'camera_id': payload.camera_id})
+    return {'ok': True, 'camera': camera, 'server_time': now}
+
+
+@router.post('/cameras/events', status_code=status.HTTP_201_CREATED)
+async def ingest_event(
+    metadata: str = Form(...),
+    evidence_image: UploadFile = File(...),
+    _: None = Depends(require_camera),
+    db: sqlite3.Connection = Depends(get_db),
+) -> dict:
+    try:
+        payload = CameraEventPayload.model_validate_json(metadata)
+    except ValidationError as exc:
+        raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=f'metadata ไม่ถูกต้อง: {exc.errors()}') from exc
+
+    current_status = _normalize_status(payload.current_status)
+    detected_ppe = sorted({_normalize_ppe(item) for item in payload.detected_ppe if item.strip()})
+    reported_missing = sorted({_normalize_ppe(item) for item in payload.missing_ppe if item.strip()})
+    required_ppe = set(settings.required_ppe)
+    computed_missing = sorted(required_ppe - set(detected_ppe))
+
+    if current_status == 'SAFE':
+        if computed_missing:
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                detail=f'SAFE ใช้ได้เฉพาะเมื่อ PPE ครบทุกชิ้น ขาด: {", ".join(computed_missing)}',
+            )
+        missing_ppe: list[str] = []
+    else:
+        missing_ppe = reported_missing or computed_missing
+        if not missing_ppe:
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                detail='NOT_SAFE ต้องระบุ missing_ppe หรือ detected_ppe ที่ทำให้ Server คำนวณ PPE ที่ขาดได้',
+            )
+
+    captured_at = _captured_at(payload)
+    captured_iso = to_iso(captured_at)
+    now_iso = to_iso(utc_now())
+    camera = _upsert_camera(db, payload.camera_id, payload.camera_name, payload.location, payload.model_version, now_iso)
+    previous_status = camera['last_status']
+
+    if previous_status == current_status:
+        db.commit()
+        return {
+            'accepted': False,
+            'reason': 'สถานะเดิมซ้ำ จึงไม่เก็บรูปและไม่สร้างเหตุการณ์ใหม่',
+            'camera_id': payload.camera_id,
+            'status': current_status,
+        }
+
+    image_rel_path = await save_evidence(evidence_image, payload.camera_id, captured_at, current_status)
+    event_id = str(uuid4())
+    violation_id: str | None = None
+    previous_duration: int | None = None
+
+    open_period = db.execute(
+        'SELECT * FROM status_periods WHERE camera_id = ? AND ended_at IS NULL ORDER BY started_at DESC LIMIT 1',
+        (payload.camera_id,),
+    ).fetchone()
+    if open_period is not None:
+        period_started = parse_iso(open_period['started_at'])
+        previous_duration = max(0, int((captured_at - period_started).total_seconds())) if period_started else None
+        db.execute('UPDATE status_periods SET ended_at = ? WHERE id = ?', (captured_iso, open_period['id']))
+
+    if current_status == 'SAFE' and previous_status == 'NOT_SAFE':
+        unresolved = db.execute(
+            '''SELECT * FROM ppe_events WHERE camera_id = ? AND status = 'NOT_SAFE' AND resolved_at IS NULL
+               ORDER BY captured_at DESC LIMIT 1''',
+            (payload.camera_id,),
+        ).fetchone()
+        if unresolved is not None:
+            violation_id = unresolved['violation_id']
+            started_at = parse_iso(unresolved['captured_at'])
+            violation_duration = max(0, int((captured_at - started_at).total_seconds())) if started_at else None
+            db.execute(
+                'UPDATE ppe_events SET resolved_at = ?, duration_seconds = ? WHERE id = ?',
+                (captured_iso, violation_duration, unresolved['id']),
+            )
+    elif current_status == 'NOT_SAFE':
+        violation_id = str(uuid4())
+
+    db.execute(
+        '''INSERT INTO ppe_events (
+            id, camera_id, person_track_id, status, previous_status, missing_ppe, detected_ppe,
+            confidence, person_count, image_rel_path, captured_at, duration_seconds, model_version,
+            violation_id, created_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)''',
+        (
+            event_id,
+            payload.camera_id,
+            payload.person_track_id,
+            current_status,
+            previous_status,
+            json.dumps(missing_ppe),
+            json.dumps(detected_ppe),
+            payload.confidence,
+            payload.person_count,
+            image_rel_path,
+            captured_iso,
+            previous_duration,
+            payload.model_version,
+            violation_id,
+            now_iso,
+        ),
+    )
+    db.execute(
+        'INSERT INTO status_periods (id, camera_id, status, started_at, source_event_id) VALUES (?, ?, ?, ?, ?)',
+        (str(uuid4()), payload.camera_id, current_status, captured_iso, event_id),
+    )
+    db.execute(
+        '''UPDATE cameras SET status = 'ONLINE', last_heartbeat_at = ?, last_status = ?, last_confidence = ?,
+           model_version = COALESCE(?, model_version), updated_at = ? WHERE id = ?''',
+        (now_iso, current_status, payload.confidence, payload.model_version, now_iso, payload.camera_id),
+    )
+    db.commit()
+
+    row = db.execute('SELECT * FROM ppe_events WHERE id = ?', (event_id,)).fetchone()
+    event = event_to_dict(row)
+    await manager.broadcast({'type': 'ppe_event', 'event_id': event_id, 'camera_id': payload.camera_id})
+    return {'accepted': True, 'event': event}
+
+
+@router.get('/cameras')
+def list_cameras(_: dict = Depends(require_user), db: sqlite3.Connection = Depends(get_db)) -> dict:
+    rows = db.execute('SELECT * FROM cameras ORDER BY id').fetchall()
+    return {'items': [camera_to_dict(row) for row in rows]}

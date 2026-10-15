@@ -1,0 +1,742 @@
+from __future__ import annotations
+
+import json
+import sqlite3
+from datetime import datetime
+from uuid import uuid4
+from zoneinfo import ZoneInfo
+
+from fastapi import (
+    APIRouter,
+    Depends,
+    File,
+    Form,
+    HTTPException,
+    UploadFile,
+    status,
+)
+from pydantic import BaseModel, Field, ValidationError
+
+from ..config import settings
+from ..database import get_db
+from ..security import require_camera, require_user
+from ..services.serializers import camera_to_dict, event_to_dict
+from ..services.storage import save_evidence
+from ..services.time_utils import parse_iso, to_iso, utc_now
+from ..websocket import manager
+
+
+router = APIRouter(
+    prefix="/api/v1",
+    tags=["cameras"],
+)
+
+
+# ============================================================
+# Request models
+# ============================================================
+
+class HeartbeatPayload(BaseModel):
+    camera_id: str = Field(
+        min_length=1,
+        max_length=120,
+    )
+
+    camera_name: str | None = Field(
+        default=None,
+        max_length=160,
+    )
+
+    location: str | None = Field(
+        default=None,
+        max_length=200,
+    )
+
+    model_version: str | None = Field(
+        default=None,
+        max_length=120,
+    )
+
+
+class CameraEventPayload(BaseModel):
+    camera_id: str = Field(
+        min_length=1,
+        max_length=120,
+    )
+
+    camera_name: str | None = Field(
+        default=None,
+        max_length=160,
+    )
+
+    location: str | None = Field(
+        default=None,
+        max_length=200,
+    )
+
+    # หนึ่งคนผ่านจุดตรวจ = หนึ่ง Session
+    # Node-RED จะส่ง session_id มาในฟิลด์นี้
+    person_track_id: str = Field(
+        min_length=1,
+        max_length=120,
+    )
+
+    captured_at: datetime
+
+    current_status: str
+
+    previous_status: str | None = None
+
+    missing_ppe: list[str] = Field(
+        default_factory=list,
+    )
+
+    detected_ppe: list[str] = Field(
+        default_factory=list,
+    )
+
+    session_duration_ms: int | None = Field(
+        default=None,
+        ge=0,
+        le=600_000,
+    )
+
+    confidence: float = Field(
+        ge=0,
+        le=1,
+    )
+
+    person_count: int = Field(
+        ge=1,
+        le=99,
+    )
+
+    model_version: str | None = Field(
+        default=None,
+        max_length=120,
+    )
+
+
+# ============================================================
+# Normalization helpers
+# ============================================================
+
+def _normalize_status(value: str) -> str:
+    normalized = (
+        value
+        .strip()
+        .upper()
+        .replace("-", "_")
+        .replace(" ", "_")
+    )
+
+    if normalized not in {"SAFE", "NOT_SAFE"}:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail=(
+                "current_status ต้องเป็น SAFE หรือ NOT_SAFE"
+            ),
+        )
+
+    return normalized
+
+
+def _normalize_ppe(value: str) -> str:
+    normalized = (
+        value
+        .strip()
+        .lower()
+        .replace("_", "-")
+    )
+
+    aliases = {
+        "safetyvest": "safety-vest",
+        "vest": "safety-vest",
+        "hardhat": "helmet",
+        "hard-hat": "helmet",
+    }
+
+    return aliases.get(
+        normalized,
+        normalized,
+    )
+
+
+def _captured_at(
+    payload: CameraEventPayload,
+) -> datetime:
+    value = payload.captured_at
+
+    if value.tzinfo is None:
+        value = value.replace(
+            tzinfo=ZoneInfo(settings.timezone)
+        )
+
+    return value.astimezone(
+        ZoneInfo("UTC")
+    )
+
+
+# ============================================================
+# Camera helper
+# ============================================================
+
+def _upsert_camera(
+    db: sqlite3.Connection,
+    camera_id: str,
+    camera_name: str | None,
+    location: str | None,
+    model_version: str | None,
+    now_iso: str,
+) -> sqlite3.Row:
+    row = db.execute(
+        "SELECT * FROM cameras WHERE id = ?",
+        (camera_id,),
+    ).fetchone()
+
+    if row is None:
+        db.execute(
+            """
+            INSERT INTO cameras (
+                id,
+                name,
+                location,
+                status,
+                last_heartbeat_at,
+                model_version,
+                updated_at
+            )
+            VALUES (
+                ?,
+                ?,
+                ?,
+                'ONLINE',
+                ?,
+                ?,
+                ?
+            )
+            """,
+            (
+                camera_id,
+                camera_name or camera_id,
+                location or "-",
+                now_iso,
+                model_version,
+                now_iso,
+            ),
+        )
+    else:
+        db.execute(
+            """
+            UPDATE cameras
+            SET
+                name = ?,
+                location = ?,
+                status = 'ONLINE',
+                last_heartbeat_at = ?,
+                model_version = COALESCE(
+                    ?,
+                    model_version
+                ),
+                updated_at = ?
+            WHERE id = ?
+            """,
+            (
+                camera_name or row["name"],
+                location or row["location"],
+                now_iso,
+                model_version,
+                now_iso,
+                camera_id,
+            ),
+        )
+
+    return db.execute(
+        "SELECT * FROM cameras WHERE id = ?",
+        (camera_id,),
+    ).fetchone()
+
+
+# ============================================================
+# Heartbeat
+# ============================================================
+
+@router.post("/cameras/heartbeat")
+async def heartbeat(
+    payload: HeartbeatPayload,
+    _: None = Depends(require_camera),
+    db: sqlite3.Connection = Depends(get_db),
+) -> dict:
+    now_iso = to_iso(
+        utc_now()
+    )
+
+    # เวลาที่ใช้ตรวจหนึ่งคนในหนึ่ง Session
+    session_duration_seconds: int | None = None
+
+    if payload.session_duration_ms is not None:
+        session_duration_seconds = int(
+            (payload.session_duration_ms + 500) // 1000
+        )
+
+    _upsert_camera(
+        db=db,
+        camera_id=payload.camera_id,
+        camera_name=payload.camera_name,
+        location=payload.location,
+        model_version=payload.model_version,
+        now_iso=now_iso,
+    )
+
+    db.commit()
+
+    row = db.execute(
+        "SELECT * FROM cameras WHERE id = ?",
+        (payload.camera_id,),
+    ).fetchone()
+
+    camera = camera_to_dict(row)
+
+    await manager.broadcast(
+        {
+            "type": "camera_heartbeat",
+            "camera_id": payload.camera_id,
+        }
+    )
+
+    return {
+        "ok": True,
+        "camera": camera,
+        "server_time": now_iso,
+    }
+
+
+# ============================================================
+# Receive PPE event
+# ============================================================
+
+@router.post(
+    "/cameras/events",
+    status_code=status.HTTP_201_CREATED,
+)
+async def ingest_event(
+    metadata: str = Form(...),
+    evidence_image: UploadFile = File(...),
+    _: None = Depends(require_camera),
+    db: sqlite3.Connection = Depends(get_db),
+) -> dict:
+    # --------------------------------------------------------
+    # 1. Validate metadata
+    # --------------------------------------------------------
+    try:
+        payload = (
+            CameraEventPayload
+            .model_validate_json(metadata)
+        )
+    except ValidationError as exc:
+        raise HTTPException(
+            status_code=(
+                status.HTTP_422_UNPROCESSABLE_ENTITY
+            ),
+            detail=(
+                "metadata ไม่ถูกต้อง: "
+                f"{exc.errors()}"
+            ),
+        ) from exc
+
+    current_status = _normalize_status(
+        payload.current_status
+    )
+
+    session_id = (
+        payload.person_track_id
+        .strip()
+    )
+
+    if not session_id:
+        raise HTTPException(
+            status_code=(
+                status.HTTP_422_UNPROCESSABLE_ENTITY
+            ),
+            detail=(
+                "person_track_id หรือ session_id "
+                "ห้ามเป็นค่าว่าง"
+            ),
+        )
+
+    detected_ppe = sorted(
+        {
+            _normalize_ppe(item)
+            for item in payload.detected_ppe
+            if item.strip()
+        }
+    )
+
+    reported_missing = sorted(
+        {
+            _normalize_ppe(item)
+            for item in payload.missing_ppe
+            if item.strip()
+        }
+    )
+
+    required_ppe = {
+        _normalize_ppe(item)
+        for item in settings.required_ppe
+    }
+
+    computed_missing = sorted(
+        required_ppe - set(detected_ppe)
+    )
+
+    # --------------------------------------------------------
+    # 2. Validate SAFE / NOT_SAFE
+    # --------------------------------------------------------
+    if current_status == "SAFE":
+        if computed_missing:
+            raise HTTPException(
+                status_code=(
+                    status.HTTP_422_UNPROCESSABLE_ENTITY
+                ),
+                detail=(
+                    "SAFE ใช้ได้เฉพาะเมื่อ PPE "
+                    "ครบทุกชิ้น ขาด: "
+                    + ", ".join(computed_missing)
+                ),
+            )
+
+        missing_ppe: list[str] = []
+
+    else:
+        # ถ้ากล้องส่ง missing_ppe มาแล้ว ให้เชื่อผลที่
+        # สรุปจาก Session หลายเฟรมก่อน
+        missing_ppe = (
+            reported_missing
+            or computed_missing
+        )
+
+        if not missing_ppe:
+            raise HTTPException(
+                status_code=(
+                    status.HTTP_422_UNPROCESSABLE_ENTITY
+                ),
+                detail=(
+                    "NOT_SAFE ต้องระบุ missing_ppe "
+                    "หรือ detected_ppe ที่ทำให้ Server "
+                    "คำนวณ PPE ที่ขาดได้"
+                ),
+            )
+
+    # --------------------------------------------------------
+    # 3. Date and camera
+    # --------------------------------------------------------
+    captured_at = _captured_at(payload)
+
+    captured_iso = to_iso(
+        captured_at
+    )
+
+    now_iso = to_iso(
+        utc_now()
+    )
+
+    camera = _upsert_camera(
+        db=db,
+        camera_id=payload.camera_id,
+        camera_name=payload.camera_name,
+        location=payload.location,
+        model_version=payload.model_version,
+        now_iso=now_iso,
+    )
+
+    previous_status = camera["last_status"]
+
+    # --------------------------------------------------------
+    # 4. Duplicate protection
+    #
+    # กฎใหม่:
+    # - ไม่ตรวจซ้ำจากสถานะ SAFE / NOT_SAFE
+    # - ตรวจซ้ำจาก camera_id + session_id
+    # --------------------------------------------------------
+    duplicate_event = db.execute(
+        """
+        SELECT
+            id,
+            camera_id,
+            person_track_id,
+            status,
+            captured_at
+        FROM ppe_events
+        WHERE camera_id = ?
+          AND person_track_id = ?
+        LIMIT 1
+        """,
+        (
+            payload.camera_id,
+            session_id,
+        ),
+    ).fetchone()
+
+    if duplicate_event is not None:
+        db.commit()
+
+        return {
+            "accepted": False,
+            "reason": (
+                "session_id เดิมถูกส่งซ้ำ "
+                "จึงไม่เก็บรูปและไม่สร้างเหตุการณ์ใหม่"
+            ),
+            "camera_id": payload.camera_id,
+            "session_id": session_id,
+            "status": current_status,
+            "existing_event_id": (
+                duplicate_event["id"]
+            ),
+            "existing_status": (
+                duplicate_event["status"]
+            ),
+        }
+
+    # --------------------------------------------------------
+    # 5. Save evidence image
+    #
+    # จะมาถึงจุดนี้เฉพาะ Session ใหม่เท่านั้น
+    # จึงไม่เกิดไฟล์ภาพซ้ำจากการ retry
+    # --------------------------------------------------------
+    image_rel_path = await save_evidence(
+        evidence_image,
+        payload.camera_id,
+        captured_at,
+        current_status,
+    )
+
+    event_id = str(
+        uuid4()
+    )
+
+    violation_id: str | None = None
+
+    # --------------------------------------------------------
+    # 6. Close previous status period
+    #
+    # เก็บไว้เพื่อไม่ให้ส่วนรายงานเดิมเสีย
+    # แต่ไม่ได้ใช้เป็นเงื่อนไขป้องกัน Event ซ้ำแล้ว
+    # --------------------------------------------------------
+    open_period = db.execute(
+        """
+        SELECT *
+        FROM status_periods
+        WHERE camera_id = ?
+          AND ended_at IS NULL
+        ORDER BY started_at DESC
+        LIMIT 1
+        """,
+        (payload.camera_id,),
+    ).fetchone()
+
+    if open_period is not None:
+        db.execute(
+            """
+            UPDATE status_periods
+            SET ended_at = ?
+            WHERE id = ?
+            """,
+            (
+                captured_iso,
+                open_period["id"],
+            ),
+        )
+
+    # --------------------------------------------------------
+    # 7. Violation
+    #
+    # NOT_SAFE ทุก Session เป็นเหตุการณ์ของคนใหม่
+    # จึงสร้าง violation_id ใหม่เสมอ
+    #
+    # SAFE ของคนใหม่จะไม่ปิด NOT_SAFE ของคนก่อน
+    # --------------------------------------------------------
+    if current_status == "NOT_SAFE":
+        violation_id = str(
+            uuid4()
+        )
+
+    # --------------------------------------------------------
+    # 8. Insert PPE event
+    # --------------------------------------------------------
+    db.execute(
+        """
+        INSERT INTO ppe_events (
+            id,
+            camera_id,
+            person_track_id,
+            status,
+            previous_status,
+            missing_ppe,
+            detected_ppe,
+            confidence,
+            person_count,
+            image_rel_path,
+            captured_at,
+            duration_seconds,
+            model_version,
+            violation_id,
+            created_at
+        )
+        VALUES (
+            ?,
+            ?,
+            ?,
+            ?,
+            ?,
+            ?,
+            ?,
+            ?,
+            ?,
+            ?,
+            ?,
+            ?,
+            ?,
+            ?,
+            ?
+        )
+        """,
+        (
+            event_id,
+            payload.camera_id,
+            session_id,
+            current_status,
+            previous_status,
+            json.dumps(
+                missing_ppe
+            ),
+            json.dumps(
+                detected_ppe
+            ),
+            payload.confidence,
+            payload.person_count,
+            image_rel_path,
+            captured_iso,
+            session_duration_seconds,
+            payload.model_version,
+            violation_id,
+            now_iso,
+        ),
+    )
+
+    # --------------------------------------------------------
+    # 9. Create status period
+    # --------------------------------------------------------
+    db.execute(
+        """
+        INSERT INTO status_periods (
+            id,
+            camera_id,
+            status,
+            started_at,
+            source_event_id
+        )
+        VALUES (
+            ?,
+            ?,
+            ?,
+            ?,
+            ?
+        )
+        """,
+        (
+            str(uuid4()),
+            payload.camera_id,
+            current_status,
+            captured_iso,
+            event_id,
+        ),
+    )
+
+    # --------------------------------------------------------
+    # 10. Update camera latest status
+    # --------------------------------------------------------
+    db.execute(
+        """
+        UPDATE cameras
+        SET
+            status = 'ONLINE',
+            last_heartbeat_at = ?,
+            last_status = ?,
+            last_confidence = ?,
+            model_version = COALESCE(
+                ?,
+                model_version
+            ),
+            updated_at = ?
+        WHERE id = ?
+        """,
+        (
+            now_iso,
+            current_status,
+            payload.confidence,
+            payload.model_version,
+            now_iso,
+            payload.camera_id,
+        ),
+    )
+
+    db.commit()
+
+    # --------------------------------------------------------
+    # 11. Return event
+    # --------------------------------------------------------
+    row = db.execute(
+        """
+        SELECT *
+        FROM ppe_events
+        WHERE id = ?
+        """,
+        (event_id,),
+    ).fetchone()
+
+    event = event_to_dict(
+        row
+    )
+
+    # ทุก Session ใหม่ส่ง WebSocket Event
+    # NOT_SAFE จึงแจ้งเตือนได้แม้คนก่อนก็ NOT_SAFE
+    await manager.broadcast(
+        {
+            "type": "ppe_event",
+            "event_id": event_id,
+            "camera_id": payload.camera_id,
+            "session_id": session_id,
+            "status": current_status,
+        }
+    )
+
+    return {
+        "accepted": True,
+        "session_id": session_id,
+        "event": event,
+    }
+
+
+# ============================================================
+# List cameras
+# ============================================================
+
+@router.get("/cameras")
+def list_cameras(
+    _: dict = Depends(require_user),
+    db: sqlite3.Connection = Depends(get_db),
+) -> dict:
+    rows = db.execute(
+        """
+        SELECT *
+        FROM cameras
+        ORDER BY id
+        """
+    ).fetchall()
+
+    return {
+        "items": [
+            camera_to_dict(row)
+            for row in rows
+        ]
+    }

@@ -1,0 +1,24 @@
+name: ppe_guard_app
+description: PPE Guard is a responsive safety-monitoring application for reCamera 2002 and an on-premises FastAPI server.
+publish_to: "none"
+version: 1.0.0+1
+
+environment:
+  sdk: ^3.5.3
+
+dependencies:
+  flutter:
+    sdk: flutter
+  http: ^1.6.0
+  intl: ^0.20.0
+  shared_preferences: ^2.3.5
+  web_socket_channel: ^2.4.5
+  url_launcher: ^6.3.1
+
+dev_dependencies:
+  flutter_test:
+    sdk: flutter
+  flutter_lints: ^4.0.0
+
+flutter:
+  uses-material-design: true

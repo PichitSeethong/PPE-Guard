@@ -1,0 +1,52 @@
+# Flutter
+ppe_guard_app/.dart_tool/
+ppe_guard_app/build/
+ppe_guard_app/.flutter-plugins
+ppe_guard_app/.flutter-plugins-dependencies
+ppe_guard_app/android/local.properties
+ppe_guard_app/**/*.iml
+
+# Python
+server/.venv/
+server/**/__pycache__/
+server/**/*.pyc
+server/.env
+
+# Local runtime data
+server/data/
+
+
+# Sensitive configuration
+**/.env
+**/.env.*
+!**/.env.example
+*.pem
+*.key
+*.p12
+*.pfx
+*.jks
+**/key.properties
+
+# Runtime and private data
+server/www/
+server/backups/
+ppe_guard_app/backups/
+**/evidence/
+**/logs/
+*.log
+*.db
+*.db-shm
+*.db-wal
+*.sqlite
+*.sqlite3
+
+# AI models and archives
+*.pt
+*.pth
+*.onnx
+*.cvimodel
+*.engine
+*.tflite
+*.zip
+*.rar
+*.7z
