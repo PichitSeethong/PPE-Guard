@@ -16,6 +16,14 @@ The system detects one person and five required PPE items:
 
 A session is marked **SAFE** only when all required PPE items are detected. Otherwise, it is recorded as **NOT SAFE**.
 
+## Project Presentation
+
+ชมวิดีโอแนะนำโครงงาน PPE Guard ระบบตรวจสอบอุปกรณ์ป้องกันส่วนบุคคลด้วย AI
+
+[![Watch the PPE Guard project presentation](https://img.youtube.com/vi/9n46qjDT2T8/hqdefault.jpg)](https://youtu.be/9n46qjDT2T8)
+
+[▶️ เปิดดูวิดีโอแนะนำโครงงาน](https://youtu.be/9n46qjDT2T8)
+
 ## System Architecture
 
 ```mermaid
