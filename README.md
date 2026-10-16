@@ -20,4 +20,8 @@ A session is marked **SAFE** only when all required PPE items are detected. Othe
 
 ```mermaid
 flowchart LR
-    A[reCamera 2002<br>YOLO11n Edge AI] -->
+    A["reCamera 2002 / YOLO11n Edge AI"] -->|HTTP JSON| B["FastAPI Server"]
+    B --> C["SQLite Database"]
+    B --> D["Local Evidence Storage"]
+    B --> E["Flutter Web/Desktop App"]
+```
